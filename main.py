@@ -2,7 +2,7 @@ import requests
 import time
 from datetime import date, timedelta
 
-TELEGRAM_TOKEN = "8436085274:AAH78VaM9i1JLISBGApGye9FZ2q7b2_Vkro"
+TELEGRAM_TOKEN = "8436085274:AAH78VaM9i1JLISBGApGye9FZ2q7p2_Vkro"
 CHAT_ID = "6100462157"
 
 # Havalimanı koordinatları - Polymarket'ın kullandığı istasyonlar
