@@ -52,7 +52,6 @@ CITIES = {
     "shenzhen":      {"lat": 22.6329,  "lon": 113.8108,  "tz": "Asia/Shanghai",                   "unit": "C"},
 }
 
-# Gecmiste daha tutarli olan sehirler
 RELIABLE_CITIES = {
     "london", "paris", "madrid", "milan", "tokyo",
     "seoul", "nyc", "atlanta", "chicago", "miami",
@@ -60,11 +59,11 @@ RELIABLE_CITIES = {
 }
 
 def send_telegram(msg):
-    url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
     try:
+        url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
-    except:
-        pass
+    except Exception as e:
+        print("Telegram hatasi:", e)
 
 def make_slug(city, target_date):
     month = target_date.strftime("%B").lower()
@@ -75,7 +74,7 @@ def make_slug(city, target_date):
 def get_polymarket_prices(slug):
     try:
         url = "https://gamma-api.polymarket.com/events?slug=" + slug
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=15)
         data = r.json()
         if not data:
             return []
@@ -86,14 +85,15 @@ def get_polymarket_prices(slug):
             price = float(m.get("lastTradePrice", 0)) * 100
             results.append((question, round(price, 1)))
         return results
-    except:
+    except Exception as e:
+        print("Polymarket hatasi:", e)
         return []
 
 def get_forecast(city_key, target_date):
-    if city_key not in CITIES:
-        return None, None
-    c = CITIES[city_key]
     try:
+        if city_key not in CITIES:
+            return None, None
+        c = CITIES[city_key]
         unit_param = "fahrenheit" if c["unit"] == "F" else "celsius"
         days_ahead = (target_date - date.today()).days + 1
         days_ahead = max(1, min(days_ahead, 7))
@@ -106,90 +106,103 @@ def get_forecast(city_key, target_date):
             "&timezone=" + c["tz"] +
             "&forecast_days=" + str(days_ahead)
         )
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=15)
         data = r.json()
         temps = data["daily"]["temperature_2m_max"]
         return round(temps[-1], 1), c["unit"]
-    except:
+    except Exception as e:
+        print("Forecast hatasi:", city_key, e)
         return None, None
 
 def find_best_bucket(prices, forecast_temp):
-    best = None
-    best_diff = 999
-    for question, price in prices:
-        for t in range(-20, 150):
-            if str(t) in question:
-                diff = abs(t - forecast_temp)
-                if diff < best_diff:
-                    best_diff = diff
-                    best = (question, price, t)
-    return best, best_diff
+    try:
+        best = None
+        best_diff = 999
+        for question, price in prices:
+            for t in range(-20, 150):
+                if str(t) in question:
+                    diff = abs(t - forecast_temp)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best = (question, price, t)
+        return best, best_diff
+    except:
+        return None, 999
 
 def analyze(city, target_date):
-    slug = make_slug(city, target_date)
-    prices = get_polymarket_prices(slug)
-    if not prices:
+    try:
+        slug = make_slug(city, target_date)
+        prices = get_polymarket_prices(slug)
+        if not prices:
+            return None
+
+        forecast_temp, unit = get_forecast(city, target_date)
+        if not forecast_temp:
+            return None
+
+        match, diff = find_best_bucket(prices, forecast_temp)
+        if not match:
+            return None
+
+        question, price, bucket = match
+
+        # Filtre: guvenilir sehir, birebir eslesme, %10-20 arasi fiyat
+        opportunity = (
+            city in RELIABLE_CITIES and
+            diff == 0 and
+            10 < price < 20
+        )
+
+        return {
+            "city": city,
+            "date": target_date.isoformat(),
+            "forecast": str(forecast_temp) + unit,
+            "bucket": str(bucket) + unit,
+            "price": price,
+            "diff": diff,
+            "opportunity": opportunity,
+        }
+    except Exception as e:
+        print("Analyze hatasi:", city, e)
         return None
-
-    forecast_temp, unit = get_forecast(city, target_date)
-    if not forecast_temp:
-        return None
-
-    match, diff = find_best_bucket(prices, forecast_temp)
-    if not match:
-        return None
-
-    question, price, bucket = match
-
-    # Sıkıştırılmış filtre:
-    # - Sadece güvenilir şehirler
-    # - Tahmin ile bucket tam eşleşmeli (diff == 0)
-    # - Market fiyatı %20'den düşük olmalı
-    opportunity = (
-        city in RELIABLE_CITIES and
-        diff == 0 and
-        price < 20
-    )
-
-    return {
-        "city": city,
-        "date": target_date.isoformat(),
-        "forecast": str(forecast_temp) + unit,
-        "bucket": str(bucket) + unit,
-        "price": price,
-        "diff": diff,
-        "opportunity": opportunity,
-    }
 
 def main():
-    send_telegram("WeatherBot v4 - Sikistirmis filtre ile basladi!")
+    send_telegram("WeatherBot v5 basladi! Kilitlenme koruması aktif.")
     print("Bot basladi.")
 
     while True:
-        today = date.today()
-        targets = [today, today + timedelta(days=1)]
+        try:
+            today = date.today()
+            targets = [today, today + timedelta(days=1)]
 
-        opportunities = []
-        scanned = 0
+            opportunities = []
+            scanned = 0
 
-        for target_date in targets:
-            for city in CITIES:
-                result = analyze(city, target_date)
-                if result:
-                    scanned += 1
-                    if result["opportunity"]:
-                        opportunities.append(result)
-                time.sleep(0.3)
+            for target_date in targets:
+                for city in CITIES:
+                    try:
+                        result = analyze(city, target_date)
+                        if result:
+                            scanned += 1
+                            if result["opportunity"]:
+                                opportunities.append(result)
+                    except Exception as e:
+                        print("Sehir hatasi:", city, e)
+                    time.sleep(0.3)
 
-        if opportunities:
-            msg = "*** GERCEK FIRSAT ***\n\n"
-            for r in opportunities:
-                msg += r["city"].upper() + " (" + r["date"] + ")\n"
-                msg += "Tahmin: " + r["forecast"] + "\n"
-                msg += "Market: " + r["bucket"] + " -> %" + str(r["price"]) + "\n\n"
-            send_telegram(msg)
-        else:
-            send_telegram("Tarama tamam. " + str(scanned) + " market. Gercek firsat yok.")
+            if opportunities:
+                msg = "*** GERCEK FIRSAT ***\n\n"
+                for r in opportunities:
+                    msg += r["city"].upper() + " (" + r["date"] + ")\n"
+                    msg += "Tahmin: " + r["forecast"] + "\n"
+                    msg += "Market: " + r["bucket"] + " -> %" + str(r["price"]) + "\n\n"
+                send_telegram(msg)
+            else:
+                send_telegram("Tarama tamam. " + str(scanned) + " market. Firsat yok.")
+
+        except Exception as e:
+            print("Ana dongu hatasi:", e)
+            send_telegram("Bot hata aldi ama devam ediyor: " + str(e))
 
         print("Sonraki tarama 3 dakika sonra...")
         time.sleep(180)
