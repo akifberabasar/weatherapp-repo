@@ -1,9 +1,16 @@
 import requests
 import time
-from datetime import date, timedelta
+import json
+import sqlite3
+import re
+import os
+from datetime import date, datetime, timedelta
 
-TELEGRAM_TOKEN = "8436085274:AAH78VaM9i1JLISBGApGye9FZ2q7p2_Vkro"
-CHAT_ID = "6100462157"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "6100462157")
+
+# Railway Volume mount edilmişse oraya, değilse local çalışma dizinine yaz
+DB_PATH = "/mnt/data/bot.db" if os.path.isdir("/mnt/data") else "bot.db"
 
 CITIES = {
     "nyc":           {"lat": 40.7769,  "lon": -73.8740,  "tz": "America/New_York",                "unit": "F"},
@@ -58,42 +65,153 @@ RELIABLE_CITIES = {
     "istanbul", "amsterdam", "munich", "singapore"
 }
 
+# -------------------- DB --------------------
+
+def db_init():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            city TEXT NOT NULL,
+            target_date TEXT NOT NULL,
+            forecast REAL NOT NULL,
+            unit TEXT NOT NULL,
+            bucket_title TEXT NOT NULL,
+            bucket_low REAL,
+            bucket_high REAL,
+            price REAL NOT NULL,
+            event_slug TEXT NOT NULL,
+            market_id TEXT,
+            actual_temp REAL,
+            actual_bucket TEXT,
+            won INTEGER
+        )
+    """)
+    # Aynı şehir + tarih + bucket için tek kayıt (duplicate uyarı engellensin)
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_unique
+        ON alerts(city, target_date, bucket_title)
+    """)
+    conn.commit()
+    conn.close()
+
+def db_save_alert(row):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO alerts
+                (ts, city, target_date, forecast, unit, bucket_title,
+                 bucket_low, bucket_high, price, event_slug, market_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.utcnow().isoformat(),
+            row["city"], row["target_date"], row["forecast"], row["unit"],
+            row["bucket_title"], row["bucket_low"], row["bucket_high"],
+            row["price"], row["event_slug"], row["market_id"],
+        ))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        # Zaten kayıtlı — duplicate uyarı, Telegram'a yeniden gönderme
+        return False
+    finally:
+        conn.close()
+
+# -------------------- Telegram --------------------
+
 def send_telegram(msg):
+    if not TELEGRAM_TOKEN:
+        print("TELEGRAM_TOKEN yok, mesaj atlandi:", msg[:60])
+        return
     try:
         url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
         print("Telegram hatasi:", e)
 
+# -------------------- Bucket parsing --------------------
+
+def parse_bucket(title, unit):
+    """
+    groupItemTitle'dan bucket'ın sayısal aralığını çıkar.
+    Döner: (low, high) — low/high dahil kenar değerler.
+    "22°C" -> (22, 22)
+    "80-81°F" -> (80, 81)
+    "15°C or below" -> (-999, 15)
+    "92°F or higher" -> (92, 999)
+    """
+    t = title.replace("°F", "").replace("°C", "").replace("\u00b0F", "").replace("\u00b0C", "").strip()
+    tl = t.lower()
+
+    if "or below" in tl:
+        n = re.search(r"-?\d+", t)
+        if not n:
+            return None
+        return (-999, int(n.group()))
+
+    if "or higher" in tl or "or above" in tl:
+        n = re.search(r"-?\d+", t)
+        if not n:
+            return None
+        return (int(n.group()), 999)
+
+    # Aralık: "80-81"
+    m = re.match(r"^(-?\d+)\s*-\s*(\d+)$", t)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+
+    # Tek sayı: "22"
+    m = re.match(r"^(-?\d+)$", t)
+    if m:
+        n = int(m.group(1))
+        return (n, n)
+
+    return None
+
+def bucket_contains(bucket, temp):
+    low, high = bucket
+    return low <= temp <= high
+
+# -------------------- Polymarket --------------------
+
 def make_slug(city, target_date):
     month = target_date.strftime("%B").lower()
-    day = target_date.day
-    year = target_date.year
-    return "highest-temperature-in-" + city + "-on-" + month + "-" + str(day) + "-" + str(year)
+    return "highest-temperature-in-" + city + "-on-" + month + "-" + str(target_date.day) + "-" + str(target_date.year)
 
-def get_polymarket_prices(slug):
+def get_polymarket_markets(slug):
     try:
         url = "https://gamma-api.polymarket.com/events?slug=" + slug
         r = requests.get(url, timeout=15)
         data = r.json()
         if not data:
             return []
-        markets = data[0].get("markets", [])
-        results = []
-        for m in markets:
-            question = m.get("question", "")
-            price = float(m.get("lastTradePrice", 0)) * 100
-            results.append((question, round(price, 1)))
-        return results
+        return data[0].get("markets", [])
     except Exception as e:
-        print("Polymarket hatasi:", e)
+        print("Polymarket hatasi (" + slug + "):", e)
         return []
 
-def get_forecast(city_key, target_date):
+def extract_yes_price(market):
+    """outcomePrices'tan 'Yes' fiyatını çek (yüzde olarak)."""
     try:
-        if city_key not in CITIES:
-            return None, None
-        c = CITIES[city_key]
+        prices = market.get("outcomePrices", "[]")
+        if isinstance(prices, str):
+            prices = json.loads(prices)
+        if not prices:
+            return None
+        return round(float(prices[0]) * 100, 2)
+    except Exception:
+        return None
+
+# -------------------- Forecast --------------------
+
+def get_forecast(city_key, target_date):
+    if city_key not in CITIES:
+        return None, None
+    c = CITIES[city_key]
+    try:
         unit_param = "fahrenheit" if c["unit"] == "F" else "celsius"
         days_ahead = (target_date - date.today()).days + 1
         days_ahead = max(1, min(days_ahead, 7))
@@ -111,101 +229,112 @@ def get_forecast(city_key, target_date):
         temps = data["daily"]["temperature_2m_max"]
         return round(temps[-1], 1), c["unit"]
     except Exception as e:
-        print("Forecast hatasi:", city_key, e)
+        print("Forecast hatasi", city_key, e)
         return None, None
 
-def find_best_bucket(prices, forecast_temp):
-    try:
-        best = None
-        best_diff = 999
-        for question, price in prices:
-            for t in range(-20, 150):
-                if str(t) in question:
-                    diff = abs(t - forecast_temp)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best = (question, price, t)
-        return best, best_diff
-    except:
-        return None, 999
+# -------------------- Analiz --------------------
 
 def analyze(city, target_date):
-    try:
-        slug = make_slug(city, target_date)
-        prices = get_polymarket_prices(slug)
-        if not prices:
-            return None
-
-        forecast_temp, unit = get_forecast(city, target_date)
-        if not forecast_temp:
-            return None
-
-        match, diff = find_best_bucket(prices, forecast_temp)
-        if not match:
-            return None
-
-        question, price, bucket = match
-
-        # Filtre: guvenilir sehir, birebir eslesme, %10-20 arasi fiyat
-        opportunity = (
-            city in RELIABLE_CITIES and
-            diff == 0 and
-            10 < price < 20
-        )
-
-        return {
-            "city": city,
-            "date": target_date.isoformat(),
-            "forecast": str(forecast_temp) + unit,
-            "bucket": str(bucket) + unit,
-            "price": price,
-            "diff": diff,
-            "opportunity": opportunity,
-        }
-    except Exception as e:
-        print("Analyze hatasi:", city, e)
+    slug = make_slug(city, target_date)
+    markets = get_polymarket_markets(slug)
+    if not markets:
         return None
 
+    forecast_temp, unit = get_forecast(city, target_date)
+    if forecast_temp is None:
+        return None
+
+    # Tahmini içeren bucket'ı bul
+    matched = None
+    for m in markets:
+        title = m.get("groupItemTitle") or ""
+        bucket = parse_bucket(title, unit)
+        if not bucket:
+            continue
+        if bucket_contains(bucket, forecast_temp):
+            price = extract_yes_price(m)
+            if price is None:
+                continue
+            matched = {
+                "title": title,
+                "low": bucket[0],
+                "high": bucket[1],
+                "price": price,
+                "market_id": str(m.get("id", "")),
+            }
+            break
+
+    if not matched:
+        return None
+
+    # Filtre: güvenilir şehir + %8-30 arası fiyat
+    # (eski "diff==0" filtresi kaldırıldı - artık bucket match'i garantili doğru)
+    opportunity = (
+        city in RELIABLE_CITIES and
+        8 <= matched["price"] <= 30
+    )
+
+    return {
+        "city": city,
+        "target_date": target_date.isoformat(),
+        "forecast": forecast_temp,
+        "unit": unit,
+        "bucket_title": matched["title"],
+        "bucket_low": matched["low"],
+        "bucket_high": matched["high"],
+        "price": matched["price"],
+        "event_slug": slug,
+        "market_id": matched["market_id"],
+        "opportunity": opportunity,
+    }
+
+# -------------------- Ana döngü --------------------
+
 def main():
-    send_telegram("WeatherBot v5 basladi! Kilitlenme koruması aktif.")
-    print("Bot basladi.")
+    db_init()
+    send_telegram("WeatherBot v6 basladi. Bucket parsing duzeldi, logging aktif.")
+    print("Bot basladi. DB:", DB_PATH)
 
     while True:
         try:
             today = date.today()
             targets = [today, today + timedelta(days=1)]
 
-            opportunities = []
+            new_opportunities = []
             scanned = 0
+            market_found = 0
 
             for target_date in targets:
                 for city in CITIES:
                     try:
                         result = analyze(city, target_date)
+                        scanned += 1
                         if result:
-                            scanned += 1
+                            market_found += 1
                             if result["opportunity"]:
-                                opportunities.append(result)
+                                saved = db_save_alert(result)
+                                if saved:
+                                    new_opportunities.append(result)
                     except Exception as e:
                         print("Sehir hatasi:", city, e)
                     time.sleep(0.3)
 
-            if opportunities:
+            if new_opportunities:
                 msg = "*** GERCEK FIRSAT ***\n\n"
-                for r in opportunities:
-                    msg += r["city"].upper() + " (" + r["date"] + ")\n"
-                    msg += "Tahmin: " + r["forecast"] + "\n"
-                    msg += "Market: " + r["bucket"] + " -> %" + str(r["price"]) + "\n\n"
+                for r in new_opportunities:
+                    msg += r["city"].upper() + " (" + r["target_date"] + ")\n"
+                    msg += "Tahmin: " + str(r["forecast"]) + r["unit"] + "\n"
+                    msg += "Bucket: " + r["bucket_title"] + " -> %" + str(r["price"]) + "\n\n"
+                msg += "Not: Paper trading modu. Para koymadan once logu kontrol et."
                 send_telegram(msg)
             else:
-                send_telegram("Tarama tamam. " + str(scanned) + " market. Firsat yok.")
+                print("Tarama: " + str(scanned) + " sehir, " + str(market_found) + " market, yeni firsat yok.")
 
         except Exception as e:
             print("Ana dongu hatasi:", e)
-            send_telegram("Bot hata aldi ama devam ediyor: " + str(e))
 
-        print("Sonraki tarama 3 dakika sonra...")
-        time.sleep(180)
+        print("Sonraki tarama 10 dakika sonra...")
+        time.sleep(600)  # 3 dk -> 10 dk. Rate limit riski azalır.
 
 if __name__ == "__main__":
     main()
