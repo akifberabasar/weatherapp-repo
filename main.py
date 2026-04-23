@@ -4,12 +4,12 @@ import json
 import sqlite3
 import re
 import os
+import threading
 from datetime import date, datetime, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "6100462157")
 
-# Railway Volume mount edilmişse oraya, değilse local çalışma dizinine yaz
 DB_PATH = "/mnt/data/bot.db" if os.path.isdir("/mnt/data") else "bot.db"
 
 CITIES = {
@@ -89,7 +89,6 @@ def db_init():
             won INTEGER
         )
     """)
-    # Aynı şehir + tarih + bucket için tek kayıt (duplicate uyarı engellensin)
     c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_unique
         ON alerts(city, target_date, bucket_title)
@@ -115,16 +114,26 @@ def db_save_alert(row):
         conn.commit()
         return True
     except sqlite3.IntegrityError:
-        # Zaten kayıtlı — duplicate uyarı, Telegram'a yeniden gönderme
         return False
     finally:
         conn.close()
+
+def db_get_stats():
+    """Stats özeti döner, /stats komutu için."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT city, target_date, forecast, unit, bucket_title, price, won FROM alerts ORDER BY ts DESC LIMIT 20")
+    rows = c.fetchall()
+    c.execute("SELECT COUNT(*), SUM(CASE WHEN won=1 THEN 1 ELSE 0 END), SUM(CASE WHEN won=0 THEN 1 ELSE 0 END) FROM alerts")
+    total, won, lost = c.fetchone()
+    conn.close()
+    return rows, (total or 0, won or 0, lost or 0)
 
 # -------------------- Telegram --------------------
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN:
-        print("TELEGRAM_TOKEN yok, mesaj atlandi:", msg[:60])
+        print("TELEGRAM_TOKEN yok, mesaj atlandi")
         return
     try:
         url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
@@ -132,43 +141,93 @@ def send_telegram(msg):
     except Exception as e:
         print("Telegram hatasi:", e)
 
+def build_stats_message():
+    rows, (total, won, lost) = db_get_stats()
+    if total == 0:
+        return "Henuz uyari yok."
+
+    pending = total - won - lost
+    msg = "== BOT STATS ==\n"
+    msg += "Toplam uyari: " + str(total) + "\n"
+    msg += "Kazanan: " + str(won) + " | Kaybeden: " + str(lost) + " | Bekleyen: " + str(pending) + "\n"
+    if won + lost > 0:
+        win_rate = won / (won + lost) * 100
+        msg += "Tutma orani: %" + str(round(win_rate, 1)) + "\n"
+    msg += "\n-- Son 20 uyari --\n"
+    for r in rows:
+        city, tdate, forecast, unit, bucket, price, w = r
+        if w == 1:
+            mark = "+"
+        elif w == 0:
+            mark = "-"
+        else:
+            mark = "?"
+        msg += mark + " " + city[:8] + " " + tdate[5:] + " " + str(forecast) + unit + " -> " + bucket + " %" + str(price) + "\n"
+    return msg
+
+# -------------------- Telegram komut dinleyici --------------------
+
+def telegram_listener():
+    """Ayrı thread'de çalışır, /stats komutunu dinler."""
+    last_update_id = 0
+    # Başlangıçta eski mesajları atlamak için son update_id'yi al
+    try:
+        url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/getUpdates"
+        r = requests.get(url, timeout=10)
+        updates = r.json().get("result", [])
+        if updates:
+            last_update_id = updates[-1]["update_id"]
+    except Exception as e:
+        print("Listener init hatasi:", e)
+
+    while True:
+        try:
+            url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/getUpdates"
+            params = {"offset": last_update_id + 1, "timeout": 30}
+            r = requests.get(url, params=params, timeout=40)
+            updates = r.json().get("result", [])
+
+            for u in updates:
+                last_update_id = u["update_id"]
+                msg = u.get("message", {})
+                text = msg.get("text", "").strip().lower()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+
+                # Sadece senin chat'inden komut kabul et
+                if chat_id != str(CHAT_ID):
+                    continue
+
+                if text == "/stats":
+                    send_telegram(build_stats_message())
+                elif text == "/ping":
+                    send_telegram("Bot ayakta. DB: " + DB_PATH)
+
+        except Exception as e:
+            print("Listener hatasi:", e)
+            time.sleep(5)
+
 # -------------------- Bucket parsing --------------------
 
 def parse_bucket(title, unit):
-    """
-    groupItemTitle'dan bucket'ın sayısal aralığını çıkar.
-    Döner: (low, high) — low/high dahil kenar değerler.
-    "22°C" -> (22, 22)
-    "80-81°F" -> (80, 81)
-    "15°C or below" -> (-999, 15)
-    "92°F or higher" -> (92, 999)
-    """
     t = title.replace("°F", "").replace("°C", "").replace("\u00b0F", "").replace("\u00b0C", "").strip()
     tl = t.lower()
-
     if "or below" in tl:
         n = re.search(r"-?\d+", t)
         if not n:
             return None
         return (-999, int(n.group()))
-
     if "or higher" in tl or "or above" in tl:
         n = re.search(r"-?\d+", t)
         if not n:
             return None
         return (int(n.group()), 999)
-
-    # Aralık: "80-81"
     m = re.match(r"^(-?\d+)\s*-\s*(\d+)$", t)
     if m:
         return (int(m.group(1)), int(m.group(2)))
-
-    # Tek sayı: "22"
     m = re.match(r"^(-?\d+)$", t)
     if m:
         n = int(m.group(1))
         return (n, n)
-
     return None
 
 def bucket_contains(bucket, temp):
@@ -194,7 +253,6 @@ def get_polymarket_markets(slug):
         return []
 
 def extract_yes_price(market):
-    """outcomePrices'tan 'Yes' fiyatını çek (yüzde olarak)."""
     try:
         prices = market.get("outcomePrices", "[]")
         if isinstance(prices, str):
@@ -239,12 +297,9 @@ def analyze(city, target_date):
     markets = get_polymarket_markets(slug)
     if not markets:
         return None
-
     forecast_temp, unit = get_forecast(city, target_date)
     if forecast_temp is None:
         return None
-
-    # Tahmini içeren bucket'ı bul
     matched = None
     for m in markets:
         title = m.get("groupItemTitle") or ""
@@ -263,17 +318,12 @@ def analyze(city, target_date):
                 "market_id": str(m.get("id", "")),
             }
             break
-
     if not matched:
         return None
-
-    # Filtre: güvenilir şehir + %8-30 arası fiyat
-    # (eski "diff==0" filtresi kaldırıldı - artık bucket match'i garantili doğru)
     opportunity = (
         city in RELIABLE_CITIES and
         8 <= matched["price"] <= 30
     )
-
     return {
         "city": city,
         "target_date": target_date.isoformat(),
@@ -292,18 +342,21 @@ def analyze(city, target_date):
 
 def main():
     db_init()
-    send_telegram("WeatherBot v6 basladi. Bucket parsing duzeldi, logging aktif.")
+
+    # Telegram listener'ı ayrı thread'de başlat
+    listener_thread = threading.Thread(target=telegram_listener, daemon=True)
+    listener_thread.start()
+
+    send_telegram("WeatherBot v6.1 basladi. /stats ve /ping komutlari aktif.")
     print("Bot basladi. DB:", DB_PATH)
 
     while True:
         try:
             today = date.today()
             targets = [today, today + timedelta(days=1)]
-
             new_opportunities = []
             scanned = 0
             market_found = 0
-
             for target_date in targets:
                 for city in CITIES:
                     try:
@@ -318,23 +371,20 @@ def main():
                     except Exception as e:
                         print("Sehir hatasi:", city, e)
                     time.sleep(0.3)
-
             if new_opportunities:
                 msg = "*** GERCEK FIRSAT ***\n\n"
                 for r in new_opportunities:
                     msg += r["city"].upper() + " (" + r["target_date"] + ")\n"
                     msg += "Tahmin: " + str(r["forecast"]) + r["unit"] + "\n"
                     msg += "Bucket: " + r["bucket_title"] + " -> %" + str(r["price"]) + "\n\n"
-                msg += "Not: Paper trading modu. Para koymadan once logu kontrol et."
+                msg += "Not: Paper trading modu. /stats ile ozet al."
                 send_telegram(msg)
             else:
                 print("Tarama: " + str(scanned) + " sehir, " + str(market_found) + " market, yeni firsat yok.")
-
         except Exception as e:
             print("Ana dongu hatasi:", e)
-
         print("Sonraki tarama 10 dakika sonra...")
-        time.sleep(600)  # 3 dk -> 10 dk. Rate limit riski azalır.
+        time.sleep(600)
 
 if __name__ == "__main__":
     main()
