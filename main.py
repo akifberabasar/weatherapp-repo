@@ -5,12 +5,21 @@ import sqlite3
 import re
 import os
 import threading
+import statistics
 from datetime import date, datetime, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "6100462157")
 
 DB_PATH = "/mnt/data/bot.db" if os.path.isdir("/mnt/data") else "bot.db"
+
+# Ensemble'da kullanacağımız modeller
+FORECAST_MODELS = ["ecmwf_ifs025", "gfs_seamless", "icon_seamless", "jma_gsm"]
+
+# Modeller arası standart sapma bu değerden büyükse fırsat verme
+# (yani modeller dağınıksa güven düşük)
+MAX_MODEL_SPREAD_C = 1.5  # Celsius şehirler için
+MAX_MODEL_SPREAD_F = 2.7  # Fahrenheit şehirler için (yaklaşık 1.5°C)
 
 CITIES = {
     "nyc":           {"lat": 40.7769,  "lon": -73.8740,  "tz": "America/New_York",                "unit": "F"},
@@ -89,6 +98,15 @@ def db_init():
             won INTEGER
         )
     """)
+    # v6.3'te eklenen kolonlar - ALTER TABLE ile eski DB'ye de eklenebilir
+    try:
+        c.execute("ALTER TABLE alerts ADD COLUMN model_ecmwf REAL")
+        c.execute("ALTER TABLE alerts ADD COLUMN model_gfs REAL")
+        c.execute("ALTER TABLE alerts ADD COLUMN model_icon REAL")
+        c.execute("ALTER TABLE alerts ADD COLUMN model_jma REAL")
+        c.execute("ALTER TABLE alerts ADD COLUMN model_spread REAL")
+    except sqlite3.OperationalError:
+        pass  # Kolonlar zaten var
     c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_unique
         ON alerts(city, target_date, bucket_title)
@@ -103,13 +121,17 @@ def db_save_alert(row):
         c.execute("""
             INSERT INTO alerts
                 (ts, city, target_date, forecast, unit, bucket_title,
-                 bucket_low, bucket_high, price, event_slug, market_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 bucket_low, bucket_high, price, event_slug, market_id,
+                 model_ecmwf, model_gfs, model_icon, model_jma, model_spread)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             datetime.utcnow().isoformat(),
             row["city"], row["target_date"], row["forecast"], row["unit"],
             row["bucket_title"], row["bucket_low"], row["bucket_high"],
             row["price"], row["event_slug"], row["market_id"],
+            row.get("model_ecmwf"), row.get("model_gfs"),
+            row.get("model_icon"), row.get("model_jma"),
+            row.get("model_spread"),
         ))
         conn.commit()
         return True
@@ -119,7 +141,6 @@ def db_save_alert(row):
         conn.close()
 
 def db_get_pending_alerts():
-    """won IS NULL olan ve target_date bugünden önce olan uyarıları döner."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     today_str = date.today().isoformat()
@@ -147,11 +168,14 @@ def db_update_result(alert_id, actual_temp, actual_bucket, won):
 def db_get_stats():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT city, target_date, forecast, unit, bucket_title, price, won, actual_bucket FROM alerts ORDER BY ts DESC LIMIT 20")
+    c.execute("""
+        SELECT city, target_date, forecast, unit, bucket_title, price,
+               won, actual_bucket, model_spread
+        FROM alerts ORDER BY ts DESC LIMIT 20
+    """)
     rows = c.fetchall()
     c.execute("SELECT COUNT(*), SUM(CASE WHEN won=1 THEN 1 ELSE 0 END), SUM(CASE WHEN won=0 THEN 1 ELSE 0 END) FROM alerts")
     total, won, lost = c.fetchone()
-    # Hipotetik PnL ($3/bahis)
     c.execute("SELECT price, won FROM alerts WHERE won IS NOT NULL")
     pnl = 0.0
     for price, w in c.fetchall():
@@ -166,7 +190,6 @@ def db_get_stats():
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN:
-        print("TELEGRAM_TOKEN yok")
         return
     try:
         url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
@@ -188,7 +211,7 @@ def build_stats_message():
         msg += "Hipotetik PnL ($3/bahis): $" + str(round(pnl, 2)) + "\n"
     msg += "\n-- Son 20 uyari --\n"
     for r in rows:
-        city, tdate, forecast, unit, bucket, price, w, actual = r
+        city, tdate, forecast, unit, bucket, price, w, actual, spread = r
         if w == 1:
             mark = "+"
         elif w == 0:
@@ -196,8 +219,10 @@ def build_stats_message():
         else:
             mark = "?"
         line = mark + " " + city[:8] + " " + tdate[5:] + " " + str(forecast) + unit + " -> " + bucket + " %" + str(price)
+        if spread is not None:
+            line += " (spread:" + str(round(spread, 1)) + ")"
         if actual and w is not None:
-            line += " (gercek: " + actual + ")"
+            line += " gercek:" + actual
         msg += line + "\n"
     return msg
 
@@ -231,7 +256,6 @@ def telegram_listener():
                 elif text == "/ping":
                     send_telegram("Bot ayakta. DB: " + DB_PATH)
                 elif text == "/check":
-                    # Manuel olarak sonuç kontrolü tetikle
                     send_telegram("Sonuc kontrolu baslatildi...")
                     count = check_results()
                     send_telegram("Kontrol bitti. " + str(count) + " uyari guncellendi.")
@@ -293,11 +317,6 @@ def extract_yes_price(market):
         return None
 
 def get_polymarket_winner(markets):
-    """
-    markets listesinden kazanan bucket'ı bul.
-    outcomePrices=["1","0"] olan bucket kazanandır.
-    Hiçbiri yoksa None döner (henüz çözülmemiş).
-    """
     for m in markets:
         try:
             prices = m.get("outcomePrices", "[]")
@@ -309,16 +328,21 @@ def get_polymarket_winner(markets):
             continue
     return None
 
-# -------------------- Forecast & Archive --------------------
+# -------------------- Ensemble Forecast --------------------
 
-def get_forecast(city_key, target_date):
+def get_ensemble_forecast(city_key, target_date):
+    """
+    4 modelin tahminini tek API çağrısı ile çeker.
+    Döner: (ortalama, dict[model->tahmin], spread, unit) veya (None, None, None, None)
+    """
     if city_key not in CITIES:
-        return None, None
+        return None, None, None, None
     c = CITIES[city_key]
     try:
         unit_param = "fahrenheit" if c["unit"] == "F" else "celsius"
         days_ahead = (target_date - date.today()).days + 1
         days_ahead = max(1, min(days_ahead, 7))
+        models_str = ",".join(FORECAST_MODELS)
         url = (
             "https://api.open-meteo.com/v1/forecast"
             "?latitude=" + str(c["lat"]) +
@@ -326,18 +350,34 @@ def get_forecast(city_key, target_date):
             "&daily=temperature_2m_max" +
             "&temperature_unit=" + unit_param +
             "&timezone=" + c["tz"] +
-            "&forecast_days=" + str(days_ahead)
+            "&forecast_days=" + str(days_ahead) +
+            "&models=" + models_str
         )
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=20)
         data = r.json()
-        temps = data["daily"]["temperature_2m_max"]
-        return round(temps[-1], 1), c["unit"]
+        daily = data.get("daily", {})
+
+        model_temps = {}
+        for model in FORECAST_MODELS:
+            key = "temperature_2m_max_" + model
+            values = daily.get(key, [])
+            if values and values[-1] is not None:
+                model_temps[model] = round(float(values[-1]), 1)
+
+        if len(model_temps) < 2:
+            # En az 2 model lazım ensemble için
+            return None, None, None, None
+
+        temps = list(model_temps.values())
+        avg = round(sum(temps) / len(temps), 1)
+        spread = round(max(temps) - min(temps), 2) if len(temps) > 1 else 0.0
+
+        return avg, model_temps, spread, c["unit"]
     except Exception as e:
-        print("Forecast hatasi", city_key, e)
-        return None, None
+        print("Ensemble forecast hatasi", city_key, e)
+        return None, None, None, None
 
 def get_archive_temp(city_key, target_date):
-    """Geçmiş bir tarih için gerçek max sıcaklığı çeker (Archive API)."""
     if city_key not in CITIES:
         return None
     c = CITIES[city_key]
@@ -367,28 +407,15 @@ def get_archive_temp(city_key, target_date):
 # -------------------- Result check --------------------
 
 def check_results():
-    """
-    Bekleyen uyarıları kontrol eder. Polymarket'te çözülmüşse
-    oradan kazanan bucket'ı alır, çözülmemişse Open-Meteo archive
-    ile gerçek sıcaklığı çeker. DB'yi günceller ve Telegram'a
-    sonuç bildirimi gönderir.
-
-    Döner: kaç uyarı güncellendi.
-    """
     pending = db_get_pending_alerts()
     if not pending:
         return 0
-
     updated = 0
     notifications = []
-
     for row in pending:
         (alert_id, city, target_date_str, forecast, unit,
          bucket_title, bucket_low, bucket_high, price, event_slug) = row
-
         target_date_obj = date.fromisoformat(target_date_str)
-
-        # 1) Polymarket dene
         winner_title = None
         try:
             markets = get_polymarket_markets(event_slug)
@@ -396,23 +423,18 @@ def check_results():
                 winner_title = get_polymarket_winner(markets)
         except Exception as e:
             print("check_results Polymarket hatasi:", city, e)
-
         actual_temp = None
         actual_bucket = None
         won = None
-
         if winner_title:
-            # Polymarket çözüldü
             actual_bucket = winner_title
             won = 1 if winner_title == bucket_title else 0
         else:
-            # 2) Archive fallback — market 4+ gün geçtiyse dene
             days_old = (date.today() - target_date_obj).days
             if days_old >= 4:
                 real_temp = get_archive_temp(city, target_date_obj)
                 if real_temp is not None:
                     actual_temp = real_temp
-                    # Hangi bucket'a düştüğünü bulmak için marketları çek
                     try:
                         markets = get_polymarket_markets(event_slug)
                         for m in markets:
@@ -425,27 +447,21 @@ def check_results():
                         pass
                     if actual_bucket:
                         won = 1 if actual_bucket == bucket_title else 0
-
         if won is not None:
             db_update_result(alert_id, actual_temp, actual_bucket, won)
             updated += 1
             mark = "KAZANDI" if won == 1 else "KAYBETTI"
             line = city.upper() + " " + target_date_str + " " + mark
             line += " | tahmin: " + bucket_title
-            if actual_bucket and actual_bucket != bucket_title:
-                line += " | gercek: " + actual_bucket
-            elif actual_bucket:
+            if actual_bucket:
                 line += " | gercek: " + actual_bucket
             if actual_temp:
                 line += " (" + str(actual_temp) + unit + ")"
             notifications.append(line)
-
         time.sleep(0.3)
-
     if notifications:
         msg = "== SONUCLAR ==\n\n" + "\n".join(notifications)
         send_telegram(msg)
-
     return updated
 
 # -------------------- Analiz --------------------
@@ -455,16 +471,23 @@ def analyze(city, target_date):
     markets = get_polymarket_markets(slug)
     if not markets:
         return None
-    forecast_temp, unit = get_forecast(city, target_date)
-    if forecast_temp is None:
+
+    avg_temp, model_temps, spread, unit = get_ensemble_forecast(city, target_date)
+    if avg_temp is None:
         return None
+
+    # Modellerin ne kadar hemfikir olduğu — güven metriği
+    max_spread = MAX_MODEL_SPREAD_F if unit == "F" else MAX_MODEL_SPREAD_C
+    low_confidence = spread > max_spread
+
+    # Ortalamanın düştüğü bucket'ı bul
     matched = None
     for m in markets:
         title = m.get("groupItemTitle") or ""
         bucket = parse_bucket(title, unit)
         if not bucket:
             continue
-        if bucket_contains(bucket, forecast_temp):
+        if bucket_contains(bucket, avg_temp):
             price = extract_yes_price(m)
             if price is None:
                 continue
@@ -475,14 +498,18 @@ def analyze(city, target_date):
             break
     if not matched:
         return None
+
+    # Filtre: guvenilir sehir + %8-30 fiyat + modeller hemfikir
     opportunity = (
         city in RELIABLE_CITIES and
-        8 <= matched["price"] <= 30
+        8 <= matched["price"] <= 30 and
+        not low_confidence
     )
+
     return {
         "city": city,
         "target_date": target_date.isoformat(),
-        "forecast": forecast_temp,
+        "forecast": avg_temp,
         "unit": unit,
         "bucket_title": matched["title"],
         "bucket_low": matched["low"],
@@ -490,6 +517,12 @@ def analyze(city, target_date):
         "price": matched["price"],
         "event_slug": slug,
         "market_id": matched["market_id"],
+        "model_ecmwf": model_temps.get("ecmwf_ifs025"),
+        "model_gfs": model_temps.get("gfs_seamless"),
+        "model_icon": model_temps.get("icon_seamless"),
+        "model_jma": model_temps.get("jma_gsm"),
+        "model_spread": spread,
+        "low_confidence": low_confidence,
         "opportunity": opportunity,
     }
 
@@ -500,13 +533,12 @@ def main():
     listener_thread = threading.Thread(target=telegram_listener, daemon=True)
     listener_thread.start()
 
-    send_telegram("WeatherBot v6.2 basladi. Otomatik sonuc takibi aktif. /stats /ping /check")
+    send_telegram("WeatherBot v6.3 basladi. Ensemble tahmin (4 model) aktif.")
     print("Bot basladi. DB:", DB_PATH)
 
     loop_count = 0
     while True:
         try:
-            # Her 6 döngüde bir (yani ~1 saatte bir) sonuç kontrolü
             if loop_count % 6 == 0:
                 try:
                     updated = check_results()
@@ -533,14 +565,26 @@ def main():
                                     new_opportunities.append(result)
                     except Exception as e:
                         print("Sehir hatasi:", city, e)
-                    time.sleep(0.3)
+                    time.sleep(0.4)  # 4 model => biraz daha yavaş gidelim
             if new_opportunities:
                 msg = "*** GERCEK FIRSAT ***\n\n"
                 for r in new_opportunities:
                     msg += r["city"].upper() + " (" + r["target_date"] + ")\n"
-                    msg += "Tahmin: " + str(r["forecast"]) + r["unit"] + "\n"
+                    msg += "Ensemble: " + str(r["forecast"]) + r["unit"] + "\n"
+                    # Her modelin ayrı tahmini
+                    mt = []
+                    if r.get("model_ecmwf") is not None:
+                        mt.append("ECMWF:" + str(r["model_ecmwf"]))
+                    if r.get("model_gfs") is not None:
+                        mt.append("GFS:" + str(r["model_gfs"]))
+                    if r.get("model_icon") is not None:
+                        mt.append("ICON:" + str(r["model_icon"]))
+                    if r.get("model_jma") is not None:
+                        mt.append("JMA:" + str(r["model_jma"]))
+                    msg += "Modeller: " + " ".join(mt) + "\n"
+                    msg += "Spread: " + str(r["model_spread"]) + r["unit"] + "\n"
                     msg += "Bucket: " + r["bucket_title"] + " -> %" + str(r["price"]) + "\n\n"
-                msg += "Paper trading modu. /stats ile ozet."
+                msg += "Paper trading. /stats ile ozet."
                 send_telegram(msg)
             else:
                 print("Tarama: " + str(scanned) + " sehir, " + str(market_found) + " market, yeni firsat yok.")
