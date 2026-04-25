@@ -198,6 +198,25 @@ def send_telegram(msg):
     except Exception as e:
         print("Telegram hatasi:", e)
 
+def send_telegram_document(file_path, caption=""):
+    """DB veya başka dosyayı Telegram'a gönder."""
+    if not TELEGRAM_TOKEN:
+        return False
+    if not os.path.exists(file_path):
+        send_telegram("Dosya bulunamadi: " + file_path)
+        return False
+    try:
+        url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendDocument"
+        with open(file_path, "rb") as f:
+            files = {"document": f}
+            data = {"chat_id": CHAT_ID, "caption": caption}
+            r = requests.post(url, data=data, files=files, timeout=60)
+            return r.status_code == 200
+    except Exception as e:
+        print("Document gonderme hatasi:", e)
+        send_telegram("Dosya gonderilemedi: " + str(e))
+        return False
+
 def build_stats_message():
     rows, (total, won, lost), pnl = db_get_stats()
     if total == 0:
@@ -260,6 +279,15 @@ def telegram_listener():
                     send_telegram("Sonuc kontrolu baslatildi...")
                     count = check_results()
                     send_telegram("Kontrol bitti. " + str(count) + " uyari guncellendi.")
+                elif text == "/dump":
+                    if os.path.exists(DB_PATH):
+                        size_kb = round(os.path.getsize(DB_PATH) / 1024, 1)
+                        send_telegram("DB gonderiliyor (" + str(size_kb) + " KB)...")
+                        ok = send_telegram_document(DB_PATH, caption="bot.db dump")
+                        if not ok:
+                            send_telegram("DB gonderilemedi.")
+                    else:
+                        send_telegram("DB bulunamadi: " + DB_PATH)
         except Exception as e:
             print("Listener hatasi:", e)
             time.sleep(5)
@@ -534,7 +562,7 @@ def main():
     listener_thread = threading.Thread(target=telegram_listener, daemon=True)
     listener_thread.start()
 
-    send_telegram("WeatherBot v6.4 basladi. Ensemble: ECMWF+GFS+ICON (JMA cikarildi).")
+    send_telegram("WeatherBot v6.5 basladi. /stats /ping /check /dump")
     print("Bot basladi. DB:", DB_PATH)
 
     loop_count = 0
