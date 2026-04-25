@@ -14,7 +14,8 @@ CHAT_ID = os.environ.get("CHAT_ID", "6100462157")
 DB_PATH = "/mnt/data/bot.db" if os.path.isdir("/mnt/data") else "bot.db"
 
 # Ensemble'da kullanacağımız modeller
-FORECAST_MODELS = ["ecmwf_ifs025", "gfs_seamless", "icon_seamless", "jma_gsm"]
+# v6.4: JMA çıkarıldı (backtest'te %42 ile en kötü performans)
+FORECAST_MODELS = ["ecmwf_ifs025", "gfs_seamless", "icon_seamless"]
 
 # Modeller arası standart sapma bu değerden büyükse fırsat verme
 # (yani modeller dağınıksa güven düşük)
@@ -533,7 +534,7 @@ def main():
     listener_thread = threading.Thread(target=telegram_listener, daemon=True)
     listener_thread.start()
 
-    send_telegram("WeatherBot v6.3 basladi. Ensemble tahmin (4 model) aktif.")
+    send_telegram("WeatherBot v6.4 basladi. Ensemble: ECMWF+GFS+ICON (JMA cikarildi).")
     print("Bot basladi. DB:", DB_PATH)
 
     loop_count = 0
