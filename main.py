@@ -71,7 +71,7 @@ CITIES = {
 
 RELIABLE_CITIES = {
     "london", "paris", "madrid", "milan", "tokyo",
-    "seoul", "nyc", "atlanta", "chicago", "miami",
+    "seoul", "nyc", "chicago", "miami",
     "istanbul", "amsterdam", "munich", "singapore"
 }
 
