@@ -577,7 +577,7 @@ def main():
                     print("check_results hatasi:", e)
 
             today = date.today()
-            targets = [today, today + timedelta(days=1)]
+            targets = [today + timedelta(days=i) for i in range(0, 7)]
             new_opportunities = []
             scanned = 0
             market_found = 0
