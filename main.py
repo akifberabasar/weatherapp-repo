@@ -70,9 +70,7 @@ CITIES = {
 }
 
 RELIABLE_CITIES = {
-    "london", "paris", "madrid", "milan", "tokyo",
-    "seoul", "nyc", "chicago", "miami",
-    "istanbul", "amsterdam", "munich", "singapore"
+    "london"
 }
 
 # -------------------- DB --------------------
