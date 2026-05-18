@@ -78,8 +78,9 @@ CITIES = {
     "kuala-lumpur":  {"lat":  2.7456, "lon": 101.7099, "tz": "Asia/Kuala_Lumpur",    "unit": "C", "station": "WMKK"},
     "jakarta":       {"lat": -6.1256, "lon": 106.6558, "tz": "Asia/Jakarta",         "unit": "C", "station": "WIII"},
 
-    # Güney Yarımküre / Latin Amerika
+    # Güney Yarımküre / Latin Amerika / Afrika
     "buenos-aires":  {"lat": -34.8222,"lon": -58.5358, "tz": "America/Argentina/Buenos_Aires", "unit": "C", "station": "SAEZ"},
+    "cape-town":     {"lat": -33.9694,"lon":  18.6022, "tz": "Africa/Johannesburg",  "unit": "C", "station": "FACT"},        # Cape Town Intl
     "sao-paulo":     {"lat": -23.4356,"lon": -46.4731, "tz": "America/Sao_Paulo",    "unit": "C", "station": "SBGR"},
     "mexico-city":   {"lat": 19.4363, "lon": -99.0721, "tz": "America/Mexico_City",  "unit": "C", "station": "MMMX"},
     "panama-city":   {"lat":  9.0714, "lon": -79.3836, "tz": "America/Panama",       "unit": "C", "station": "MPTO"},
@@ -93,11 +94,11 @@ CITIES = {
     "lucknow":       {"lat": 26.7606, "lon":  80.8893, "tz": "Asia/Kolkata",         "unit": "C", "station": "VILK"},
 }
 
-# v6.6: London kanitlanmis, NYC paper-mode (alerts var ama opportunity=False)
-# Reliable = alert gonderir, gercek bahis icin uygun
-# Paper = sadece istatistik icin alert gonderir (Telegram'da "[PAPER]" prefix)
-RELIABLE_CITIES = {"london"}
-PAPER_CITIES = {"nyc", "miami", "chicago", "paris", "madrid"}  # istatistik için
+# v6.6: London kanıtlanmış (gerçek 1/1 + paper 5/7)
+# Buenos Aires + Cape Town secondary marketler — rekabet az, edge window saatlerce sürebiliyor
+# NYC/Miami/Chicago/Paris/Madrid PAPER — istasyon düzeltmesi sonrası performans test edilecek
+RELIABLE_CITIES = {"london", "buenos-aires", "cape-town"}
+PAPER_CITIES = {"nyc", "miami", "chicago", "paris", "madrid"}
 
 
 # -------------------- DB --------------------
