@@ -94,11 +94,12 @@ CITIES = {
     "lucknow":       {"lat": 26.7606, "lon":  80.8893, "tz": "Asia/Kolkata",         "unit": "C", "station": "VILK"},
 }
 
-# v6.6: London kanıtlanmış (gerçek 1/1 + paper 5/7)
-# Buenos Aires + Cape Town secondary marketler — rekabet az, edge window saatlerce sürebiliyor
-# NYC/Miami/Chicago/Paris/Madrid PAPER — istasyon düzeltmesi sonrası performans test edilecek
-RELIABLE_CITIES = {"london", "buenos-aires", "cape-town"}
-PAPER_CITIES = {"nyc", "miami", "chicago", "paris", "madrid"}
+# v6.6: London kanıtlanmış (gerçek 1/1 + paper 5/7) — sadece bu reliable
+# Buenos Aires + Cape Town secondary marketler, PAPER'da test ediliyor
+# 10-20 sample sonra performansa göre RELIABLE'a alınabilir
+# NYC/Miami/Chicago/Paris/Madrid PAPER — istasyon düzeltmesi sonrası performans testi
+RELIABLE_CITIES = {"london"}
+PAPER_CITIES = {"buenos-aires", "cape-town", "nyc", "miami", "chicago", "paris", "madrid"}
 
 
 # -------------------- DB --------------------
