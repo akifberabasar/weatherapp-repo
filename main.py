@@ -225,7 +225,7 @@ def db_get_stats():
     return rows, (total or 0, won or 0, lost or 0), pnl
 
 
-def db_compute_city_bias(city, unit, min_samples=5):
+def db_compute_city_bias(city, unit, min_samples=10):
     """
     v6.6: Geçmiş alertlerden bu şehir için sistematik bias hesapla.
     Eğer bot ortalama 1.5°F düşük tahmin ediyorsa, gelecek tahminlere +1.5°F ekleyebiliriz.
@@ -614,7 +614,7 @@ def analyze(city, target_date):
         return None
 
     # v6.6: Bias correction — eğer bu şehir için tutarlı sapma varsa düzelt
-    bias = db_compute_city_bias(city, unit, min_samples=5)
+    bias = db_compute_city_bias(city, unit, min_samples=10)
     adjusted_temp = round(avg_temp + bias, 1)
 
     # Spread filtreleri
